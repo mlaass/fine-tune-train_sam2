@@ -13,6 +13,7 @@ import torch
 import cv2
 import os
 import random  # Added for seeding
+import time  # Import time module
 
 # import json # Removed, now handled in data_loader
 from sam2.build_sam import build_sam2
@@ -29,11 +30,19 @@ ANNOTATION_FILE = r"../output/train.json"  # Path to COCO annotations file
 
 # Model paths and definition
 # Choose one model config and corresponding checkpoint:
-# MODEL_CFG = "sam2_hiera_t.yaml"; SAM2_CHECKPOINT = "sam2_hiera_tiny.pt"
-MODEL_CFG = "sam2_hiera_s.yaml"
-SAM2_CHECKPOINT = "sam2_hiera_small.pt"  # Defaulting to small
-# MODEL_CFG = "sam2_hiera_b+.yaml"; SAM2_CHECKPOINT = "sam2_hiera_base_plus.pt"
-# MODEL_CFG = "sam2_hiera_l.yaml"; SAM2_CHECKPOINT = "sam2_hiera_large.pt"
+MODEL_CFG = "sam2_hiera_t.yaml"
+SAM2_CHECKPOINT = "sam2_hiera_tiny.pt"
+
+# MODEL_CFG = "sam2_hiera_s.yaml"
+# SAM2_CHECKPOINT = "sam2_hiera_small.pt"
+
+# MODEL_CFG = "sam2_hiera_b+.yaml"
+# SAM2_CHECKPOINT = "sam2_hiera_base_plus.pt"
+
+# MODEL_CFG = "sam2_hiera_l.yaml"
+# SAM2_CHECKPOINT = "sam2_hiera_large.pt"
+
+SAM2_CHECKPOINT_PATH = f"./checkpoints/{SAM2_CHECKPOINT}"
 
 OUTPUT_DIR = "./finetuned_sam2_models"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -47,10 +56,11 @@ print(f"Using device: {DEVICE}")
 
 LEARNING_RATE = 1e-5  # Fine-tuning often uses smaller LRs
 WEIGHT_DECAY = 4e-5  # Using original script's value
-NUM_ITERATIONS = 100000  # Renamed from NUM_EPOCHS as it's iteration-based
+NUM_ITERATIONS = 1000
 RANDOM_SEED = 42
-SAVE_INTERVAL = 1000  # How often to save the model
+SAVE_INTERVAL = 500  # How often to save the model
 TARGET_IMAGE_SIZE = 1024  # Target size to resize images/masks to
+DISPLAY_INTERVAL = 50  # How often to print status updates
 
 # Augmentation Configuration
 AUGMENTATIONS = {
@@ -82,13 +92,13 @@ data = load_coco_data(ANNOTATION_FILE, IMAGE_DIR)
 
 # Load model
 
-print(f"Loading model: {MODEL_CFG} with checkpoint: {SAM2_CHECKPOINT}")
+print(f"Loading model: {MODEL_CFG} with checkpoint: {SAM2_CHECKPOINT_PATH}")
 try:
-    sam2_model = build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device=DEVICE)  # load model using config
+    sam2_model = build_sam2(MODEL_CFG, SAM2_CHECKPOINT_PATH, device=DEVICE)  # load model using config
 except Exception as e:
     print(f"Error loading model or checkpoint: {e}")
     print(
-        f"Ensure MODEL_CFG='{MODEL_CFG}' and SAM2_CHECKPOINT='{SAM2_CHECKPOINT}' are correct and the checkpoint file exists."
+        f"Ensure MODEL_CFG='{MODEL_CFG}' and SAM2_CHECKPOINT='{SAM2_CHECKPOINT_PATH}' are correct and the checkpoint file exists."
     )
     exit()
 
@@ -135,6 +145,9 @@ scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda"))  # mixed pre
 # Training loop
 print(f"Starting training for {NUM_ITERATIONS} iterations...")
 mean_iou = 0  # Initialize mean_iou
+start_time = time.time()  # Record start time
+last_display_time = start_time
+last_display_itr = 0
 
 for itr in range(NUM_ITERATIONS):  # Use config NUM_ITERATIONS
     # Call the imported read_batch function, passing necessary configs
@@ -223,11 +236,38 @@ for itr in range(NUM_ITERATIONS):  # Use config NUM_ITERATIONS
             print(f"--- Iteration {itr}: Model saved to {OUTPUT_MODEL_PATH} ---")
 
         # Display results periodically
-        display_interval = 10  # How often to print status
-        if itr % display_interval == 0:
+        if itr % DISPLAY_INTERVAL == 0:
+            current_time = time.time()
+            elapsed_time_total = current_time - start_time
+            elapsed_time_interval = current_time - last_display_time
+            iterations_in_interval = itr - last_display_itr
+
+            # Calculate ETR based on the last interval
+            if iterations_in_interval > 0:
+                time_per_iter = elapsed_time_interval / iterations_in_interval
+                remaining_iters = NUM_ITERATIONS - itr
+                etr_seconds = remaining_iters * time_per_iter
+
+                # Format ETR into H:M:S
+                etr_h = int(etr_seconds // 3600)
+                etr_m = int((etr_seconds % 3600) // 60)
+                etr_s = int(etr_seconds % 60)
+                etr_str = f"{etr_h:02d}:{etr_m:02d}:{etr_s:02d}"
+            else:
+                etr_str = "N/A"  # Not enough info yet
+
+            # Format total elapsed time
+            elapsed_h = int(elapsed_time_total // 3600)
+            elapsed_m = int((elapsed_time_total % 3600) // 60)
+            elapsed_s = int(elapsed_time_total % 60)
+            elapsed_str = f"{elapsed_h:02d}:{elapsed_m:02d}:{elapsed_s:02d}"
+
             print(
-                f"Iter {itr}/{NUM_ITERATIONS} | Loss: {loss.item():.4f} (Seg: {seg_loss.item():.4f}, Score: {score_loss.item():.4f}) | Inst IOU: {current_iou:.4f} | Mean IOU: {mean_iou:.4f}"
+                f"Iter {itr}/{NUM_ITERATIONS} | Loss: {loss.item():.4f} (Seg: {seg_loss.item():.4f}, Score: {score_loss.item():.4f}) | "
+                f"Inst IOU: {current_iou:.4f} | Mean IOU: {mean_iou:.4f} | Elapsed: {elapsed_str} | ETR: {etr_str}"
             )
+            last_display_time = current_time
+            last_display_itr = itr
 
     except Exception as e:
         print(f"Error during training iteration {itr}: {e}")

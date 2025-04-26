@@ -9,3 +9,4 @@ _C.*
 outputs/*
 checkpoints/*.pt
 test_dataloader_output/
+finetuned_sam2_models/*.pth
