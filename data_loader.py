@@ -122,10 +122,12 @@ def apply_augmentations(image, masks, config):
     return final_img, aug_masks
 
 
-def read_batch(data, target_image_size, augmentations_config):
-    """Prepares a batch (image, masks, points) from loaded COCO data."""
+def _read_and_process_single_sample(data, target_image_size, augmentations_config):
+    """Prepares a single sample (image, masks, points) from loaded COCO data.
+    Internal function used by the new read_batch.
+    """
     if not data:
-        print("Error: Data list is empty in read_batch.")
+        print("Error: Data list is empty in _read_and_process_single_sample.")
         return None, None, None, None
 
     # -- Select Image and Annotations --
@@ -333,3 +335,64 @@ def read_batch(data, target_image_size, augmentations_config):
     labels = np.ones([len(points), 1], dtype=np.int32)  # Use int32 as labels are usually ints
 
     return final_img, final_masks, points, labels
+
+
+def read_batch(data, batch_size, target_image_size, augmentations_config):
+    """Reads and processes a batch of samples."""
+    batch_images = []
+    batch_masks = []
+    batch_points = []
+    batch_labels = []
+
+    attempts = 0
+    max_attempts = batch_size * 2  # Allow some failures
+
+    while len(batch_images) < batch_size and attempts < max_attempts:
+        attempts += 1
+        img, masks, points, labels = _read_and_process_single_sample(data, target_image_size, augmentations_config)
+
+        if img is not None and masks is not None and points is not None and labels is not None:
+            # Ensure the sample read is valid before adding
+            if masks.shape[0] > 0 and points.shape[0] > 0 and masks.shape[0] == points.shape[0]:
+                # We need to select ONE mask/point pair for the batch item,
+                # consistent with the original multi-batch script logic.
+                selected_idx = random.randrange(masks.shape[0])
+                batch_images.append(img)
+                batch_masks.append(masks[selected_idx])  # Select one mask
+                batch_points.append(points[selected_idx])  # Select corresponding point
+                batch_labels.append(labels[selected_idx])  # Select corresponding label
+            # else: # Optionally log if a sample was valid but had inconsistent mask/point counts
+            # print(f"Warning: Skipping sample due to inconsistent masks/points ({masks.shape[0]} vs {points.shape[0]})")
+
+        # else: # Optionally log skipped samples
+        # print(f"Warning: _read_and_process_single_sample returned None. Attempt {attempts}/{max_attempts}")
+
+    if len(batch_images) < batch_size:
+        print(
+            f"Warning: Could only collect {len(batch_images)} samples after {max_attempts} attempts. Returning None for batch."
+        )
+        return None, None, None, None
+
+    # Stack masks, points, and labels into batch tensors
+    try:
+        final_masks = np.stack(batch_masks, axis=0)  # (B, H, W)
+        final_points = np.stack(
+            batch_points, axis=0
+        )  # (B, 1, 1, 2) -> (B, 1, 2) after squeeze? Check shape. Needs to be (B, 1, 2) for SAM
+        final_points = final_points.squeeze(axis=1)  # Make it (B, 1, 2)
+        final_labels = np.stack(batch_labels, axis=0)  # (B, 1)
+
+        # Validate final shapes before returning
+        if final_masks.shape != (batch_size, target_image_size, target_image_size):
+            raise ValueError(f"Final batch masks shape mismatch: {final_masks.shape}")
+        if final_points.shape != (batch_size, 1, 2):
+            raise ValueError(f"Final batch points shape mismatch: {final_points.shape}")
+        if final_labels.shape != (batch_size, 1):
+            raise ValueError(f"Final batch labels shape mismatch: {final_labels.shape}")
+
+    except ValueError as e:
+        print(f"Error stacking batch data: {e}")
+        return None, None, None, None
+
+    # Images remain a list as expected by predictor.set_image_batch
+    return batch_images, final_masks, final_points, final_labels

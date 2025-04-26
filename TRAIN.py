@@ -20,7 +20,7 @@ from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 # Import the new data loader functions
-from data_loader import load_coco_data, read_batch
+from data_loader import load_coco_data, _read_and_process_single_sample
 
 # --- Configuration ---
 # Dataset paths
@@ -150,16 +150,32 @@ last_display_time = start_time
 last_display_itr = 0
 
 for itr in range(NUM_ITERATIONS):  # Use config NUM_ITERATIONS
-    # Call the imported read_batch function, passing necessary configs
-    image, mask, input_point, input_label = read_batch(data, TARGET_IMAGE_SIZE, AUGMENTATIONS)
+    # Call the imported _read_and_process_single_sample function, passing necessary configs
+    # This function now returns potentially multiple masks/points for a single image
+    image, all_masks, all_points, all_labels = _read_and_process_single_sample(data, TARGET_IMAGE_SIZE, AUGMENTATIONS)
 
-    if image is None:  # read_batch now returns None on failure/skip
+    if image is None:  # _read_and_process_single_sample now returns None on failure/skip
         print(f"Skipping iteration {itr} due to data loading issue.")
         continue
 
+    # --- Select ONE mask/point for training (original TRAIN.py logic) ---
+    # The _read_and_process_single_sample now returns all masks/points found
+    # We need to randomly select one pair for this training script.
+    if all_masks is None or all_masks.shape[0] == 0:
+        print(f"Warning: Skipping iteration {itr} due to empty or None masks after processing.")
+        continue  # ignore if no valid masks were found
+
+    num_available_masks = all_masks.shape[0]
+    selected_idx = random.randrange(num_available_masks)
+
+    mask = all_masks[selected_idx : selected_idx + 1]  # Keep dimension (1, H, W)
+    input_point = all_points[selected_idx : selected_idx + 1]  # Keep dimension (1, 1, 2)
+    input_label = all_labels[selected_idx : selected_idx + 1]  # Keep dimension (1, 1)
+    # --- End Mask/Point Selection ---
+
     if mask.shape[0] == 0:
-        print(f"Warning: Skipping iteration {itr} due to empty mask.")
-        continue  # ignore empty batches
+        print(f"Warning: Skipping iteration {itr} due to empty mask after selection.")
+        continue  # ignore empty batches (shouldn't happen with check above)
 
     try:  # Add try-except for CUDA errors etc.
         with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):  # cast to mix precision based on device

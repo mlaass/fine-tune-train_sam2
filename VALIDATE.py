@@ -53,6 +53,7 @@ FINETUNED_MODEL_PATH = os.path.join(FINETUNED_MODEL_DIR, FINETUNED_MODEL_NAME)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TARGET_IMAGE_SIZE = 1024  # Should match the training image size
 IOU_THRESHOLD = 0.5  # Threshold for predicted mask binarization when calculating TP/FP/FN/TN and IoU
+USE_FINETUNED_WEIGHTS = True  # Set to False to run evaluation with base model only
 
 # --- End Configuration ---
 
@@ -62,7 +63,10 @@ print(f"Image Directory: {IMAGE_DIR}")
 print(f"Category Map: {CATEGORY_MAP_FILE}")
 print(f"Model Config: {MODEL_CFG}")
 print(f"Base Checkpoint: {BASE_SAM2_CHECKPOINT_PATH}")
-print(f"Fine-tuned Weights: {FINETUNED_MODEL_PATH}")
+if USE_FINETUNED_WEIGHTS:
+    print(f"Fine-tuned Weights: {FINETUNED_MODEL_PATH}")
+else:
+    print(f"Fine-tuned Weights: SKIPPED (using base model only)")
 print(f"Device: {DEVICE}")
 print(f"Target Image Size: {TARGET_IMAGE_SIZE}")
 print(f"IoU Threshold: {IOU_THRESHOLD}")
@@ -215,56 +219,55 @@ def main():
         print(f"Error loading base model or checkpoint: {e}")
         return
 
-    # Load fine-tuned weights
-    print(f"Loading fine-tuned weights from: {FINETUNED_MODEL_PATH}")
-    if not os.path.exists(FINETUNED_MODEL_PATH):
-        print(f"Error: Fine-tuned weights not found at {FINETUNED_MODEL_PATH}")
-        print("Ensure TRAIN.py has run successfully and saved the model.")
-        return
-    try:
-        # Load the state dict - ensure it matches the keys in sam2_model
-        # state_dict = torch.load(FINETUNED_MODEL_PATH, map_location=DEVICE)
+    # --- Load fine-tuned weights (Optional) ---
+    if USE_FINETUNED_WEIGHTS:
+        print(f"Attempting to load fine-tuned weights from: {FINETUNED_MODEL_PATH}")
+        if not os.path.exists(FINETUNED_MODEL_PATH):
+            print(f"Error: Fine-tuned weights not found at {FINETUNED_MODEL_PATH}")
+            print("Ensure TRAIN.py has run successfully and saved the model, or set USE_FINETUNED_WEIGHTS to False.")
+            return
+        try:
+            # Load the state dict - ensure it matches the keys in sam2_model
+            loaded_state_dict = torch.load(FINETUNED_MODEL_PATH, map_location=DEVICE)
+            # Get the current model's state dict
+            current_model_state_dict = sam2_model.state_dict()
+            # Create a new state dict matching the current model structure
+            new_state_dict = current_model_state_dict.copy()
 
-        # --- Smart State Dict Loading ---
-        # Load the saved state dict
-        loaded_state_dict = torch.load(FINETUNED_MODEL_PATH, map_location=DEVICE)
-        # Get the current model's state dict
-        current_model_state_dict = sam2_model.state_dict()
-        # Create a new state dict matching the current model structure
-        new_state_dict = current_model_state_dict.copy()
-
-        # Filter and update weights
-        updated_keys = 0
-        skipped_keys = 0
-        mismatched_keys = 0
-        print("Comparing loaded weights with model structure...")
-        for k, v in loaded_state_dict.items():
-            if k in new_state_dict:
-                if new_state_dict[k].shape == v.shape:
-                    new_state_dict[k] = v
-                    updated_keys += 1
+            # Filter and update weights
+            updated_keys = 0
+            skipped_keys = 0
+            mismatched_keys = 0
+            print("Comparing loaded weights with model structure...")
+            for k, v in loaded_state_dict.items():
+                if k in new_state_dict:
+                    if new_state_dict[k].shape == v.shape:
+                        new_state_dict[k] = v
+                        updated_keys += 1
+                    else:
+                        print(f"  Skipping {k}: Shape mismatch (Model: {new_state_dict[k].shape}, File: {v.shape})")
+                        mismatched_keys += 1
                 else:
-                    print(f"  Skipping {k}: Shape mismatch (Model: {new_state_dict[k].shape}, File: {v.shape})")
-                    mismatched_keys += 1
+                    # print(f"  Skipping {k}: Key not found in current model.") # Less verbose
+                    skipped_keys += 1
+
+            print(
+                f"Weight loading summary: Updated {updated_keys}, Skipped (not found) {skipped_keys}, Skipped (shape mismatch) {mismatched_keys}"
+            )
+
+            if updated_keys == 0:
+                print("Warning: No weights were updated from the fine-tuned file. Check path and structure.")
+                # Continue with base weights
             else:
-                # print(f"  Skipping {k}: Key not found in current model.") # Less verbose
-                skipped_keys += 1
-
-        print(
-            f"Weight loading summary: Updated {updated_keys}, Skipped (not found) {skipped_keys}, Skipped (shape mismatch) {mismatched_keys}"
-        )
-
-        if updated_keys == 0:
-            print("Warning: No weights were updated. Check if the fine-tuned model path and structure are correct.")
-            # Optionally exit or continue with base model weights only
-            # return
-
-        # Load the potentially filtered state dict
-        sam2_model.load_state_dict(new_state_dict, strict=False)  # Use strict=False as we might only load parts
-        print("Successfully loaded fine-tuned weights.")
-    except Exception as e:
-        print(f"Error loading fine-tuned weights: {e}")
-        return
+                # Load the potentially filtered state dict
+                sam2_model.load_state_dict(new_state_dict, strict=False)  # Use strict=False as we might only load parts
+                print("Successfully loaded fine-tuned weights.")
+        except Exception as e:
+            print(f"Error loading fine-tuned weights: {e}")
+            return
+    else:
+        print("Skipping fine-tuned weight loading as requested.")
+    # --- End Fine-tuned weights loading ---
 
     predictor = SAM2ImagePredictor(sam2_model)
     predictor.model.eval()  # Set model to evaluation mode
@@ -529,8 +532,12 @@ def main():
 
     # --- Save Detailed Results to JSON ---
     if category_results:
+        # Determine filename suffix based on whether fine-tuned weights were used
+        eval_type_suffix = "finetuned" if USE_FINETUNED_WEIGHTS else "base"
+        base_output_name = os.path.splitext(FINETUNED_MODEL_NAME)[0]
+
         results_filename = os.path.join(
-            FINETUNED_MODEL_DIR, f"{os.path.splitext(FINETUNED_MODEL_NAME)[0]}_validation_metrics.json"
+            FINETUNED_MODEL_DIR, f"{base_output_name}_validation_metrics_{eval_type_suffix}.json"
         )
         try:
             with open(results_filename, "w") as f:
@@ -557,12 +564,16 @@ def main():
 
         ax.set_xlabel("Mean Instance IoU")
         ax.set_ylabel("Category")
-        ax.set_title(f"Mean Instance IoU per Category (Validation Set) Model: {FINETUNED_MODEL_NAME}")
+        # Update plot title based on evaluation type
+        plot_title = (
+            f"Mean Instance IoU per Category (Validation Set) Model: {FINETUNED_MODEL_NAME} ({eval_type_suffix})"
+        )
+        ax.set_title(plot_title)
         ax.set_xlim(0, 1)
         plt.tight_layout()
-        plot_filename = os.path.join(
-            FINETUNED_MODEL_DIR, f"{os.path.splitext(FINETUNED_MODEL_NAME)[0]}_validation_iou.png"
-        )
+
+        # Update plot filename
+        plot_filename = os.path.join(FINETUNED_MODEL_DIR, f"{base_output_name}_validation_iou_{eval_type_suffix}.png")
         try:
             plt.savefig(plot_filename)
             print(f"Saved per-category IoU plot to: {plot_filename}")
