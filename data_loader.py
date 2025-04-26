@@ -376,10 +376,7 @@ def read_batch(data, batch_size, target_image_size, augmentations_config):
     # Stack masks, points, and labels into batch tensors
     try:
         final_masks = np.stack(batch_masks, axis=0)  # (B, H, W)
-        final_points = np.stack(
-            batch_points, axis=0
-        )  # (B, 1, 1, 2) -> (B, 1, 2) after squeeze? Check shape. Needs to be (B, 1, 2) for SAM
-        final_points = final_points.squeeze(axis=1)  # Make it (B, 1, 2)
+        final_points = np.stack(batch_points, axis=0)  # Should be (B, 1, 2)
         final_labels = np.stack(batch_labels, axis=0)  # (B, 1)
 
         # Validate final shapes before returning
