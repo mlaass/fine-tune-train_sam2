@@ -12,128 +12,198 @@ import numpy as np
 import torch
 import cv2
 import os
+import random  # Added for seeding
+
+# import json # Removed, now handled in data_loader
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-# Read data
+# Import the new data loader functions
+from data_loader import load_coco_data, read_batch
 
-data_dir = r"LabPicsV1//"  # Path to dataset (LabPics 1)
-data = []  # list of files in dataset
-for ff, name in enumerate(os.listdir(data_dir + "Simple/Train/Image/")):  # go over all folder annotation
-    data.append(
-        {
-            "image": data_dir + "Simple/Train/Image/" + name,
-            "annotation": data_dir + "Simple/Train/Instance/" + name[:-4] + ".png",
-        }
-    )
+# --- Configuration ---
+# Dataset paths
+# Note: The script expects a specific structure within DATA_DIR: Simple/Train/Image/ and Simple/Train/Instance/
+IMAGE_DIR = r"../images/"  # Path to the directory containing all images
+ANNOTATION_FILE = r"../output/train.json"  # Path to COCO annotations file
 
+# Model paths and definition
+# Choose one model config and corresponding checkpoint:
+# MODEL_CFG = "sam2_hiera_t.yaml"; SAM2_CHECKPOINT = "sam2_hiera_tiny.pt"
+MODEL_CFG = "sam2_hiera_s.yaml"
+SAM2_CHECKPOINT = "sam2_hiera_small.pt"  # Defaulting to small
+# MODEL_CFG = "sam2_hiera_b+.yaml"; SAM2_CHECKPOINT = "sam2_hiera_base_plus.pt"
+# MODEL_CFG = "sam2_hiera_l.yaml"; SAM2_CHECKPOINT = "sam2_hiera_large.pt"
 
-def read_batch(data):  # read random image and its annotaion from  the dataset (LabPics)
+OUTPUT_DIR = "./finetuned_sam2_models"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Using a more descriptive name based on the checkpoint
+FINETUNED_MODEL_NAME = f"{os.path.splitext(SAM2_CHECKPOINT)[0]}_finetuned_decoder.pth"
+OUTPUT_MODEL_PATH = os.path.join(OUTPUT_DIR, FINETUNED_MODEL_NAME)
 
-    #  select image
+# Training Hyperparameters
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
 
-    ent = data[np.random.randint(len(data))]  # choose random entry
-    Img = cv2.imread(ent["image"])[..., ::-1]  # read image
-    ann_map = cv2.imread(ent["annotation"])  # read annotation
+LEARNING_RATE = 1e-5  # Fine-tuning often uses smaller LRs
+WEIGHT_DECAY = 4e-5  # Using original script's value
+NUM_ITERATIONS = 100000  # Renamed from NUM_EPOCHS as it's iteration-based
+RANDOM_SEED = 42
+SAVE_INTERVAL = 1000  # How often to save the model
+TARGET_IMAGE_SIZE = 1024  # Target size to resize images/masks to
 
-    # resize image
+# Augmentation Configuration
+AUGMENTATIONS = {
+    "enabled": True,  # Master switch for augmentations
+    "prob": 0.75,  # Probability of applying any augmentation to a sample
+    "scale": {"min": 0.8, "max": 1.2},  # Scale range (relative)
+    "translate": {"max_x": 0.1, "max_y": 0.1},  # Max translation (fraction of width/height)
+    "rotate": {"max_deg": 5},  # Max rotation degrees
+    "noise": {"enabled": True, "std_dev": 10},  # Gaussian noise standard deviation
+}
 
-    r = np.min([1024 / Img.shape[1], 1024 / Img.shape[0]])  # scalling factor
-    Img = cv2.resize(Img, (int(Img.shape[1] * r), int(Img.shape[0] * r)))
-    ann_map = cv2.resize(
-        ann_map, (int(ann_map.shape[1] * r), int(ann_map.shape[0] * r)), interpolation=cv2.INTER_NEAREST
-    )
+# Decide which parts of the model to train. Only training decoder/prompts is faster.
+TRAIN_MASK_DECODER = True
+TRAIN_PROMPT_ENCODER = True
+TRAIN_IMAGE_ENCODER = False  # Requires significant GPU memory and removing no_grad calls in SAM2 code
 
-    # merge vessels and materials annotations
+# --- End Configuration ---
 
-    mat_map = ann_map[:, :, 0]  # material annotation map
-    ves_map = ann_map[:, :, 2]  # vessel  annotaion map
-    mat_map[mat_map == 0] = ves_map[mat_map == 0] * (mat_map.max() + 1)  # merge maps
+# Set random seed for reproducibility
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(RANDOM_SEED)
 
-    # Get binary masks and points
-
-    inds = np.unique(mat_map)[1:]  # load all indices
-    points = []
-    masks = []
-    for ind in inds:
-        mask = (mat_map == ind).astype(np.uint8)  # make binary mask corresponding to index ind
-        masks.append(mask)
-        coords = np.argwhere(mask > 0)  # get all coordinates in mask
-        yx = np.array(coords[np.random.randint(len(coords))])  # choose random point/coordinate
-        points.append([[yx[1], yx[0]]])
-    return Img, np.array(masks), np.array(points), np.ones([len(masks), 1])
-
+# Load data using the imported function
+print(f"Loading annotations from: {ANNOTATION_FILE}")
+data = load_coco_data(ANNOTATION_FILE, IMAGE_DIR)
 
 # Load model
 
-sam2_checkpoint = "sam2_hiera_small.pt"  # path to model weight (pre model loaded from: https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_small.pt)
-model_cfg = "sam2_hiera_s.yaml"  #  model config
-sam2_model = build_sam2(model_cfg, sam2_checkpoint, device="cuda")  # load model
+print(f"Loading model: {MODEL_CFG} with checkpoint: {SAM2_CHECKPOINT}")
+try:
+    sam2_model = build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device=DEVICE)  # load model using config
+except Exception as e:
+    print(f"Error loading model or checkpoint: {e}")
+    print(
+        f"Ensure MODEL_CFG='{MODEL_CFG}' and SAM2_CHECKPOINT='{SAM2_CHECKPOINT}' are correct and the checkpoint file exists."
+    )
+    exit()
+
 predictor = SAM2ImagePredictor(sam2_model)
 
 # Set training parameters
 
-predictor.model.sam_mask_decoder.train(True)  # enable training of mask decoder
-predictor.model.sam_prompt_encoder.train(True)  # enable training of prompt encoder
-"""
-#The main part of the net is the image encoder, if you have good GPU you can enable training of this part by using:
-predictor.model.image_encoder.train(True)
-#Note that for this case, you will also need to scan the SAM2 code for “no_grad” commands and remove them (“ no_grad” blocks the gradient collection, which saves memory but prevents training).
-"""
-optimizer = torch.optim.AdamW(params=predictor.model.parameters(), lr=1e-5, weight_decay=4e-5)
-scaler = torch.cuda.amp.GradScaler()  # mixed precision
+# --- Enable Training Components ---
+# Decide which parts of the model to train. Only training decoder/prompts is faster.
+# TRAIN_MASK_DECODER = True # Moved to config section
+# TRAIN_PROMPT_ENCODER = True # Moved to config section
+# TRAIN_IMAGE_ENCODER = False # Requires significant GPU memory and removing no_grad calls in SAM2 code # Moved to config section
+
+print(
+    f"Training - Mask Decoder: {TRAIN_MASK_DECODER}, Prompt Encoder: {TRAIN_PROMPT_ENCODER}, Image Encoder: {TRAIN_IMAGE_ENCODER}"
+)
+
+if TRAIN_MASK_DECODER:
+    predictor.model.sam_mask_decoder.train(True)
+else:
+    predictor.model.sam_mask_decoder.train(False)
+
+if TRAIN_PROMPT_ENCODER:
+    predictor.model.sam_prompt_encoder.train(True)
+else:
+    predictor.model.sam_prompt_encoder.train(False)
+
+if TRAIN_IMAGE_ENCODER:
+    predictor.model.image_encoder.train(True)
+    print(
+        "Warning: Training the image encoder requires significant GPU memory and might require code changes in SAM2 to remove 'no_grad' blocks."
+    )
+else:
+    predictor.model.image_encoder.train(False)
+# --- End Enable Training Components ---
+
+
+optimizer = torch.optim.AdamW(
+    params=filter(lambda p: p.requires_grad, predictor.model.parameters()), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+)  # Use config LR and WD, filter un-trainable params
+scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda"))  # mixed precision, enable only for CUDA
+
 
 # Training loop
+print(f"Starting training for {NUM_ITERATIONS} iterations...")
+mean_iou = 0  # Initialize mean_iou
 
-for itr in range(100000):
-    with torch.cuda.amp.autocast("cuda"):  # cast to mix precision
-        image, mask, input_point, input_label = read_batch(data)  # load data batch
-        if mask.shape[0] == 0:
-            continue  # ignore empty batches
-        predictor.set_image(image)  # apply SAM image encoder to the image
+for itr in range(NUM_ITERATIONS):  # Use config NUM_ITERATIONS
+    # Call the imported read_batch function, passing necessary configs
+    image, mask, input_point, input_label = read_batch(data, TARGET_IMAGE_SIZE, AUGMENTATIONS)
 
-        # prompt encoding
+    if image is None:  # read_batch now returns None on failure/skip
+        print(f"Skipping iteration {itr} due to data loading issue.")
+        continue
 
-        mask_input, unnorm_coords, labels, unnorm_box = predictor._prep_prompts(
-            input_point, input_label, box=None, mask_logits=None, normalize_coords=True
-        )
-        sparse_embeddings, dense_embeddings = predictor.model.sam_prompt_encoder(
-            points=(unnorm_coords, labels),
-            boxes=None,
-            masks=None,
-        )
+    if mask.shape[0] == 0:
+        print(f"Warning: Skipping iteration {itr} due to empty mask.")
+        continue  # ignore empty batches
 
-        # mask decoder
+    try:  # Add try-except for CUDA errors etc.
+        with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda")):  # cast to mix precision based on device
+            predictor.set_image(image)  # apply SAM image encoder to the image
 
-        batched_mode = unnorm_coords.shape[0] > 1  # multi object prediction
-        high_res_features = [feat_level[-1].unsqueeze(0) for feat_level in predictor._features["high_res_feats"]]
-        low_res_masks, prd_scores, _, _ = predictor.model.sam_mask_decoder(
-            image_embeddings=predictor._features["image_embed"][-1].unsqueeze(0),
-            image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=True,
-            repeat_image=batched_mode,
-            high_res_features=high_res_features,
-        )
-        prd_masks = predictor._transforms.postprocess_masks(
-            low_res_masks, predictor._orig_hw[-1]
-        )  # Upscale the masks to the original image resolution
+            # prompt encoding
 
-        # Segmentaion Loss caclulation
+            mask_input, unnorm_coords, labels, unnorm_box = predictor._prep_prompts(
+                input_point, input_label, box=None, mask_logits=None, normalize_coords=True
+            )
+            sparse_embeddings, dense_embeddings = predictor.model.sam_prompt_encoder(
+                points=(unnorm_coords, labels),
+                boxes=None,
+                masks=None,
+            )
 
-        gt_mask = torch.tensor(mask.astype(np.float32)).cuda()
-        prd_mask = torch.sigmoid(prd_masks[:, 0])  # Turn logit map to probability map
-        seg_loss = (
-            -gt_mask * torch.log(prd_mask + 0.00001) - (1 - gt_mask) * torch.log((1 - prd_mask) + 0.00001)
-        ).mean()  # cross entropy loss
+            # mask decoder
 
-        # Score loss calculation (intersection over union) IOU
+            batched_mode = unnorm_coords.shape[0] > 1  # multi object prediction
+            high_res_features = [feat_level[-1].unsqueeze(0) for feat_level in predictor._features["high_res_feats"]]
+            low_res_masks, prd_scores, _, _ = predictor.model.sam_mask_decoder(
+                image_embeddings=predictor._features["image_embed"][-1].unsqueeze(0),
+                image_pe=predictor.model.sam_prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=True,
+                repeat_image=batched_mode,
+                high_res_features=high_res_features,
+            )
+            prd_masks = predictor._transforms.postprocess_masks(
+                low_res_masks, predictor._orig_hw[-1]
+            )  # Upscale the masks to the original image resolution
 
-        inter = (gt_mask * (prd_mask > 0.5)).sum(1).sum(1)
-        iou = inter / (gt_mask.sum(1).sum(1) + (prd_mask > 0.5).sum(1).sum(1) - inter)
-        score_loss = torch.abs(prd_scores[:, 0] - iou).mean()
-        loss = seg_loss + score_loss * 0.05  # mix losses
+            # Segmentaion Loss caclulation
+
+            # Ensure mask is on the correct device and is float32
+            gt_mask = torch.tensor(mask.astype(np.float32)).to(DEVICE)
+            prd_mask = torch.sigmoid(prd_masks[:, 0])  # Turn logit map to probability map
+            # Add stability term epsilon
+            epsilon = 1e-5
+            seg_loss = (
+                -gt_mask * torch.log(prd_mask + epsilon) - (1 - gt_mask) * torch.log(1 - prd_mask + epsilon)
+            ).mean()  # binary cross entropy loss with epsilon
+
+            # Score loss calculation (intersection over union) IOU
+
+            iou_pred_thresh = 0.5
+            prd_mask_binary = prd_mask > iou_pred_thresh
+            inter = (gt_mask * prd_mask_binary).sum(dim=(1, 2))  # Sum over H, W
+            union = gt_mask.sum(dim=(1, 2)) + prd_mask_binary.sum(dim=(1, 2)) - inter
+            iou = torch.mean(inter / (union + epsilon))  # Calculate mean IOU over batch dimension (even if 1)
+
+            # Ensure prd_scores shape matches expected usage if needed, default is [num_masks, num_classes (usually 1)]
+            # Assuming prd_scores[:, 0] is the relevant score for the single class case
+            score_loss = torch.abs(prd_scores[:, 0] - iou).mean()  # Use calculated mean IOU
+
+            loss = seg_loss + score_loss * 0.05  # mix losses
 
         # apply back propogation
 
@@ -142,13 +212,34 @@ for itr in range(100000):
         scaler.step(optimizer)
         scaler.update()  # Mix precision
 
-        if itr % 1000 == 0:
-            torch.save(predictor.model.state_dict(), "model.torch")
-            print("save model")
+        current_iou = iou.cpu().detach().item()  # Get scalar IOU value
+        mean_iou = mean_iou * 0.99 + 0.01 * current_iou
 
-        # Display results
+        if itr % SAVE_INTERVAL == 0 and itr > 0:  # Save using config interval, skip first iteration
+            # Save only the trainable parts if desired (usually smaller files)
+            # state_dict_to_save = {k: v for k, v in predictor.model.state_dict().items() if v.requires_grad}
+            state_dict_to_save = predictor.model.state_dict()  # Saving full state dict for now
+            torch.save(state_dict_to_save, OUTPUT_MODEL_PATH)
+            print(f"--- Iteration {itr}: Model saved to {OUTPUT_MODEL_PATH} ---")
 
-        if itr == 0:
-            mean_iou = 0
-        mean_iou = mean_iou * 0.99 + 0.01 * np.mean(iou.cpu().detach().numpy())
-        print("step)", itr, "Accuracy(IOU)=", mean_iou)
+        # Display results periodically
+        display_interval = 10  # How often to print status
+        if itr % display_interval == 0:
+            print(
+                f"Iter {itr}/{NUM_ITERATIONS} | Loss: {loss.item():.4f} (Seg: {seg_loss.item():.4f}, Score: {score_loss.item():.4f}) | Inst IOU: {current_iou:.4f} | Mean IOU: {mean_iou:.4f}"
+            )
+
+    except Exception as e:
+        print(f"Error during training iteration {itr}: {e}")
+        # Optional: break or continue depending on error type
+        if isinstance(e, torch.cuda.OutOfMemoryError):
+            print("CUDA Out of Memory. Try reducing image size or model complexity if training encoder.")
+            # Consider stopping or skipping
+        # break # Stop training on error
+
+print(f"--- Training Finished ---")
+# Final save
+# state_dict_to_save = {k: v for k, v in predictor.model.state_dict().items() if v.requires_grad}
+state_dict_to_save = predictor.model.state_dict()  # Saving full state dict
+torch.save(state_dict_to_save, OUTPUT_MODEL_PATH)
+print(f"Final model saved to {OUTPUT_MODEL_PATH}")
